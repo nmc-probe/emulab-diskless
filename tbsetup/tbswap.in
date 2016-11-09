@@ -87,6 +87,7 @@ use Experiment;
 use User;
 use Lan;
 use Firewall;
+use libdiskless;
 
 #
 # Actual swap-in and swap-out functions, defined below.
@@ -494,6 +495,12 @@ sub doSwapout($) {
     my $swapout_errors = 0;
 
     tblog_set_cleanup(1) if $type == CLEANUP;
+
+    # Get a list of node ids for this experiments - this is needed
+    # for diskless Emulab and is a hack. Things should be done
+    # differently and provisioning / deprovisioning should happen
+    # elsewhere
+    @nodelist = ExpNodes($pid, $eid, 1, 0);
 
     #
     # wait for os_setup;
@@ -972,6 +979,7 @@ sub doSwapout($) {
 	$experiment->ClearGlobalIPAllocation();
     }
 
+    deprovision_diskless_nodes(\@nodelist);
     tblog_set_cleanup(0);
     return $swapout_errors;
 }

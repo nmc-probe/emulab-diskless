@@ -48,6 +48,7 @@ use English;
 use Data::Dumper;
 use EmulabFeatures;
 use Image;
+use libdiskless;
 
 # Configure variables
 my $TB		= "@prefix@";
@@ -545,6 +546,16 @@ sub SetOSAux($$$$$)
     }
 }
 
+sub LightUpNodes($@)
+{
+    # TODO - make a different node type, like pc_diskless,
+    # and put this LightUpNodes into a different package
+    my ($self, @nodelist) = @_;
+    my @failed   = ();
+    provision_diskless_nodes(\@nodelist);
+    return scalar(@failed);
+}
+
 #
 # Take a list of nodes and fire off the required reloads/reboots/reconfigs
 # in parallel, then wait for finish.
@@ -552,7 +563,7 @@ sub SetOSAux($$$$$)
 # This is called in a child (fork) so all state has to be communicated via
 # the DB, back to the parent. See the WaitForNodes() function. 
 #
-sub LightUpNodes($@)
+sub LightUpNodesStockEmulab($@)
 {
     my ($self, @nodelist) = @_;
     my @children = ();

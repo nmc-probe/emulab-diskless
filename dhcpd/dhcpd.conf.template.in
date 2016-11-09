@@ -13,7 +13,11 @@ server-name                     "@BOSSNODE_IP@";
 
 # Config these too?
 option  root-path		"/tftpboot";
-filename 			"/tftpboot/pxeboot.emu";
+if ((exists user-class) and (option user-class = "iPXE")) {
+        filename "http://@BOSSNODE_IP@/boot.py";
+} else {
+        filename "undionly.kpxe";
+}
 
 default-lease-time              36000;                  # 10 hours
 max-lease-time                  36000;                  # 10 hours

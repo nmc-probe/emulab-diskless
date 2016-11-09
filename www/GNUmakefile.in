@@ -46,7 +46,7 @@ SUBDIRS = tutorial
 # is changed.
 # 
 all: defs.php3 dbdefs.php3 websearch htmlinstall xmlrpc.php3 \
-	xmlrpcpipe.php3 blob/read.php3 all-subdirs
+	xmlrpcpipe.php3 blob/read.php3 event.py boot.py all-subdirs
 
 include $(TESTBED_SRCDIR)/GNUmakerules
 
@@ -54,7 +54,7 @@ include $(TESTBED_SRCDIR)/GNUmakerules
 # Generate a list of all the files we want to install from the current
 # directory and the source directory. 
 #
-FILES	= $(wildcard *.css *.jpg *.gif *.png *.html *.php3 *.php *.ico *.jar)
+FILES	= $(wildcard *.css *.jpg *.gif *.png *.html *.php3 *.php *.py *.ico *.jar)
 FILES  += $(wildcard $(SRCDIR)/*.css)
 FILES  += $(wildcard $(SRCDIR)/*.jpg)
 FILES  += $(wildcard $(SRCDIR)/*.png)
@@ -62,6 +62,7 @@ FILES  += $(wildcard $(SRCDIR)/*.gif)
 FILES  += $(wildcard $(SRCDIR)/*.html)
 FILES  += $(wildcard $(SRCDIR)/*.php3)
 FILES  += $(wildcard $(SRCDIR)/*.php)
+FILES  += $(wildcard $(SRCDIR)/*.py)
 FILES  += $(wildcard $(SRCDIR)/*.ico)
 FILES  += $(wildcard $(SRCDIR)/*.class)
 FILES  += $(wildcard $(SRCDIR)/*.jar)
@@ -298,6 +299,11 @@ $(INSTALL_WWWDIR)/%.html: %.html htmlinstall
 	@echo "Installing $<"
 	-mkdir -p $(patsubst %/,%,$(dir $@))
 	$(HTMLINSTALL) $(subst $$,\$$,$<) $(subst $$,\$$,$@)
+
+$(INSTALL_WWWDIR)/%.py: %.py
+	@echo "Installing $<"
+	-mkdir -p $(patsubst %/,%,$(dir $@))
+	$(INSTALL_PROGRAM) $(subst $$,\$$,$<) $(subst $$,\$$,$@)
 
 $(INSTALL_WWWDIR)/%: %
 	@echo "Installing $<"

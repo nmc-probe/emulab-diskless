@@ -111,7 +111,7 @@ LIB_STUFF       = libtbsetup.pm exitonwarn.pm libtestbed.pm \
 		  libadminmfs.pm libtblog.pm libtblog_simple.pm libArchive.pm \
 		  power_mail.pm power_whol.pm Template.pm power_rmcp.pm \
 		  power_ilo.pm libvtop.pm libptop.pm libptop_new.pm \
-		  libossetup.pm \
+		  libossetup.pm libdiskless.pm \
 		  power_ipmi.pm libosload_new.pm libosload_switch.pm \
 		  libossetup_switch.pm power_icebox.pm power_ibm_bch.pm \
 		  libvtop_stable.pm libvtop_test.pm
