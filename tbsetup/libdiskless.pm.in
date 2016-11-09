@@ -1,0 +1,1969 @@
+#!/usr/bin/perl -wT
+#
+# Copyright (c) 2000-2014 University of Utah and the Flux Group.
+#
+# {{{EMULAB-LICENSE
+#
+# This file is part of the Emulab network testbed software.
+#
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+#
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+#
+# }}}
+#
+# diskless library. Written to provision diskless nodes using ZFS + iSCSI.
+#
+
+package libdiskless;
+
+use strict;
+use Exporter;
+use vars qw(@ISA @EXPORT);
+use LWP::UserAgent;
+use JSON;
+use Data::Dumper;
+
+@ISA    = "Exporter";
+@EXPORT = qw ( provision_diskless_nodes deprovision_diskless_nodes);
+
+my $ssl_crt_file = "@prefix@/etc/lun_clone.crt";
+my $ssl_key_file = "@prefix@/etc/lun_clone.key";
+
+# Timeout for waiting for nodes to get into the RELOADING state
+# before provisioning the iSCSI LUNs
+my $enter_pxewait_timeout = 600;
+
+# Timeout for waiting for lun clones to be created or destroyed (seconds)
+my $lun_clone_timeout = 2000;
+
+# Time to sleep while polling the clone servers for finished jobs (seconds)
+my $lun_clone_poll_interval = 1;
+
+# Timeout for HTTP connections
+my $http_timeout = 120;
+
+# Move to /etc/emulab/diskless.conf
+my $percent_wanted_for_batch = 0.1;
+# Percent of number of nodes remaining to be provisioned to form a batch
+my $batch_percent = 0.1;
+# Anything more than this number qualifies for a batch
+my $total_wanted_for_batch = 10;
+my $batch_interval = 20;
+
+
+my $pxewait_timeout = 180;
+my $num_reboots = 4;
+
+use libtestbed; # for TBGenSecretKey();
+use libdb;
+use libreboot;
+use libtblog;
+use Node;
+use NodeType;
+use Interface;
+use Image;
+use User;
+use OSinfo;
+use English;
+use event;
+
+my $debug_level = 0;
+
+my $OURDOMAIN = '@OURDOMAIN@';
+
+# Provision iSCSI LUNS for a set of nodes
+sub provision_diskless_nodes($) {
+    debug_func_entry("provision_diskless_nodes", \@_);
+    my $nodes = shift();
+    my $num_errors = provision_luns($nodes, \&tbinfo, \&error_handler);
+    debug(10, "leaving provision_diskless_nodes");
+    return $num_errors;
+}
+
+# De-provision iSCSI LUNS for a set of nodes
+sub deprovision_diskless_nodes($) {
+    debug_func_entry("deprovision_diskless_nodes", \@_);
+    my ($node_ids) = @_;
+
+    my $nodes = node_ids_to_node_objects($node_ids);
+
+    my $num_errors = deprovision_luns($nodes, \&tbinfo, \&error_handler);
+    debug(10, "leaving deprovision_diskless_nodes");
+    return $num_errors;
+}
+
+sub provision_luns($$$) {
+    debug_func_entry("provision_luns", \@_);
+    my ($nodes, $status_cb, $error_cb) = @_;
+    my $action = 'create';
+    # Nodes that failed LUN provisioning process
+    my $failed_nodes = {};
+    # Jobs that failed
+    my $failed_jobs = [];
+    # List of provisioning jobs
+    my $job_list = [];
+    # Partion table updates
+    my $update_partitions = {};
+    # Overall provisioning_timeout
+    my $provisioning_timeout = time() + $num_reboots * $pxewait_timeout;
+
+    my $num_errors = check_nodes($nodes);
+    if ($num_errors > 0) {
+        $error_cb->("Not all nodes are properly configured, experiment swap " .
+                    "in will fail");
+        return $num_errors;
+    }
+
+    # List of nodes that need LUNs.
+    my $needs_lun = node_ids_to_nodes($nodes);
+
+    my ($targets, $upts, $server_node) = iscsi_target_list($needs_lun, $action,
+                                                           $status_cb,
+                                                           $error_cb);
+    $update_partitions = set_add($update_partitions, $upts);
+
+    my $job = start_provision_job($targets, $action, $status_cb,
+                                  $error_cb);
+
+    # Add the jobs to the list
+    while(my ($host, $job_id) = each %$job) {
+        push(@$job_list, {'host' => $host,
+                          'job_id' => $job_id,
+                          'nodes' => $server_node->{$host}});
+    }
+
+    my $num_remaining = @$job_list;
+
+    while (time() <= $provisioning_timeout && $num_remaining > 0) {
+        foreach my $job (@$job_list) {
+            if (!$job->{'handled'}) {
+                my $status = lun_clone_status($job->{'host'}, $job->{'job_id'},
+                                              $status_cb, $error_cb);
+                $job->{'percent_completed'} = $status->{'percent_completed'};
+                $job->{'status'} = $status->{'status'};
+                if ($job->{'status'} eq 'complete' ||
+                    $job->{'status'} eq 'failed') {
+                    if ($job->{'status'} eq 'failed') {
+                        push(@$failed_jobs, $job);
+                        while (my ($node_id, $node) = each $job->{'nodes'}) {
+                            $status_cb->("Adding failed node $node_id");
+                            $failed_nodes->{$node_id} = $node;
+                        }
+                        if (defined($status->{'error'})) {
+                            $status_cb->($status->{'error'});
+                        } else {
+                            $status_cb->("Unknown error");
+                        }
+                    }
+                    $job->{'handled'} = 1;
+                    $job->{'percent_completed'} = 1.0;
+                    $num_remaining = $num_remaining - 1;
+               }
+
+               print_lun_clone_progress($job, $action, $status_cb, $error_cb);
+           }
+        }
+    }
+
+    my @failed_nodes = values(%{$failed_nodes});
+    my $num_failed_nodes = @failed_nodes;
+    if ($num_failed_nodes > 0) {
+        $error_cb->("LUN provisioning process failed for nodes @failed_nodes");
+    }
+
+    # Do not update partition tables for failed nodes
+    while (my ($node_id, $node) = each %$failed_nodes) {
+        delete $update_partitions->{$node_id};
+    }
+
+    # Update the partitions table in tbdb, update cmdline in nodes table
+    release_from_pxewait($update_partitions, $status_cb, $error_cb);
+
+    return \@failed_nodes;
+}
+
+sub deprovision_luns($$$) {
+    my ($nodes, $status_cb, $error_cb) = @_;
+
+    my $action = 'delete';
+
+    my $num_errors = check_nodes($nodes);
+    if ($num_errors > 0) {
+        $error_cb->("Not all nodes are properly configured, experiment swap " .
+                    "in will fail");
+        return $num_errors;
+    }
+
+    # List of nodes that need LUNs.
+    my $needs_lun = node_ids_to_nodes($nodes);
+    my $node_ids = node_ids_to_nodes($nodes);
+    # Nodes with LUNs provisioned
+    my $has_lun = {};
+    # Nodes that failed LUN provisioning process
+    my $failed_nodes = {};
+    # Jobs that failed
+    my $failed_jobs = [];
+    # Nodes that are being provisioned
+    my $being_provisioned = {};
+    # When is it ok to start another batch?
+    my $time_to_batch = time() + $batch_interval;
+    # When should nodes that are not waiting be rebooted?
+    my $time_to_reboot = time();
+    # Overall provisioning_timeout
+    my $provisioning_timeout = time() + $num_reboots * $pxewait_timeout;
+    # List of provisioning jobs
+    my $job_list = [];
+    # Partion table updates
+    my $update_partitions = {};
+
+    # List of nodes that are not in PXEWAIT
+    my $waiting = nodes_waiting($needs_lun);
+
+    # List of nodes in PXEWAIT
+    my $not_waiting = set_subtract($needs_lun, $waiting);
+
+    debug(20, "Nodes waiting: ");
+    while (my ($key, $value) = each %$waiting) {
+        debug(20, "$key: $value");
+    }
+
+    debug(20, "Nodes not waiting: ");
+    while (my ($key, $value) = each %$not_waiting) {
+        debug(20, "$key: $value");
+    }
+
+    debug(20, "nodes waiting: ", keys %$waiting);
+    debug(20, "nodes not waiting:", keys %$not_waiting);
+
+    # Update waiting and not_waiting as PXEWAIT events are received
+    my $ev_handle = create_event_handler(
+        sub {
+            my ($handle, $notification, undef) = @_;
+            my $node_id = event_notification_get_objname($handle,
+                                                         $notification);
+            my $event   = event_notification_get_eventtype($handle,
+                                                           $notification);
+
+            if(defined($node_id) && defined($event)) {
+                if (defined($not_waiting->{$node_id})) {
+                    $status_cb->("Received $event from $node_id, moving to ",
+                                 "list of waiting nodes");
+                    $waiting->{$node_id} = $not_waiting->{$node_id};
+                    delete $not_waiting->{$node_id};
+                }
+            }
+       });
+
+    if (!defined($ev_handle)) {
+        return 1;
+    }
+
+    my $num_remaining = keys %{$needs_lun};
+
+    # Place to keep all $server_node return values. The goal is to keep the
+    # reference counts above 1
+    my @server_node_list = ();
+
+    while (time() <= $provisioning_timeout && $num_remaining > 0) {
+       my $ready = set_subtract($waiting, $being_provisioned);
+       $ready = set_subtract($ready, $has_lun);
+       #print("ready: "); print_set($ready); print("\n");
+       # Determine the size needed for a batch
+       my $num_ready = keys %{$ready};
+
+       # Minimum batch size
+       my $min_batch_size = $num_remaining * $batch_percent;
+       if ($min_batch_size < 1) {
+           $min_batch_size = 1;
+       }
+       # debug(10, "min_batch_size: $min_batch_size");
+
+       # If the number of nodes that are in PXEWAIT exceed the number
+       # that we want for a batch, start a LUN provisioning job
+       if ($num_ready >= $min_batch_size && time() >= $time_to_batch) {
+           debug(20, "num_ready >= min_batch_size: " .
+                     "$num_ready >= $min_batch_size");
+           my ($targets, $upts, $server_node) = iscsi_target_list($ready, $action,
+                                                    $status_cb, $error_cb);
+           $update_partitions = set_add($update_partitions, $upts);
+           push(@server_node_list, $server_node);
+           my $job = start_provision_job($targets, $action, $status_cb,
+                                         $error_cb);
+           $being_provisioned = set_add($being_provisioned, $ready);
+           debug(10, "targets: " . Dumper($targets));
+
+           # Add the jobs to the list
+           while(my ($host, $job_id) = each %$job) {
+               push(@$job_list, {'host' => $host,
+                                 'job_id' => $job_id,
+                                 'nodes' => $server_node->{$host}});
+           }
+           $time_to_batch = time() + $batch_interval;
+       }
+
+       foreach my $job (@$job_list) {
+        #    debug(20, "******");
+        #    while (my ($key, $value) = each %$job) {
+        #        debug(20, "$key: $value");
+        #    }
+        #    debug(20, "******");
+
+           if (!$job->{'handled'}) {
+               my $status = lun_clone_status($job->{'host'}, $job->{'job_id'},
+                                             $status_cb, $error_cb);
+               $job->{'percent_completed'} = $status->{'percent_completed'};
+               $job->{'status'} = $status->{'status'};
+               if ($job->{'status'} eq 'complete' ||
+                   $job->{'status'} eq 'failed') {
+                   if ($job->{'status'} eq 'failed') {
+                       push(@$failed_jobs, $job);
+                   }
+
+                #    debug(10, "job: $job, nodes: ", $job->{'nodes'});
+                #    while (my ($key, $value) = each %$job) {
+                #        debug(20, "$key: $value");
+                #    }
+
+                #    my $nodes = [];
+                #    if (defined($job->{'nodes'})) {
+                #        $nodes = $job->{'nodes'};
+                   #
+                #        foreach my $node (@{$nodes}) {
+                #            debug(20, "*** $node");
+                #        }
+                #    } else {
+                #        $error_cb->("No nodes for job_id $job->{'job_id'}, ",
+                #                    "host: $job->{'host'}");
+                #    }
+
+                   foreach my $node_id (@{$job->{'nodes'}}) {
+                       my $node = $node_ids->{$node_id};
+                       if ($job->{'status'} eq 'complete') {
+                           $has_lun->{$node_id} = $node;
+                       } else {
+                           $status_cb->("Adding failed node $node_id");
+                           $failed_nodes->{$node_id} = $node;
+                       }
+                       delete $needs_lun->{$node_id};
+                   }
+                   $job->{'handled'} = 1;
+                   $job->{'percent_completed'} = 1.0;
+               }
+
+               print_lun_clone_progress($job, $action, $status_cb, $error_cb);
+           }
+       }
+
+       # Reboot any nodes that have not made it to PXEWAIT
+       event_poll($ev_handle);
+       my @not_waiting = keys %{$not_waiting};
+       my $num_not_waiting = @not_waiting;
+
+       if ($num_not_waiting > 0 && time() >= $time_to_reboot) {
+           $status_cb->("Waiting for nodes @not_waiting to enter PXEWAIT");
+           reboot($not_waiting);
+           $time_to_reboot = time() + $pxewait_timeout;
+       }
+
+       $num_remaining = keys %{$needs_lun};
+
+       # usleep masquerading as select.
+       select(undef, undef, undef, 0.25);
+    }
+
+    if (event_unregister($ev_handle) == 0) {
+       $status_cb->("Unable to unregister with event system");
+    }
+
+    my @failed_node_ids = keys(%{$failed_nodes});
+    my @failed_nodes = values(%{$failed_nodes});
+    my $num_failed_nodes = @failed_nodes;
+    if ($num_failed_nodes > 0) {
+        $error_cb->("LUN provisioning process failed for nodes @failed_nodes");
+    }
+
+    # Total hack, updates the node state in the DB so that the nodes are
+    # free. Bypasses stated, programming by side effect. I'm sure this
+    # won't ever come back to haunt me. -jbowles
+    while (my ($node_id, $node) = each %$has_lun) {
+        $num_errors += clear_node_state($node_id);
+    }
+
+    return \@failed_nodes;
+}
+
+sub start_provision_job($$$$) {
+    debug_func_entry("start_provision_job", \@_);
+    my ($targets, $action, $status_cb, $error_cb) = @_;
+    return lun_clone($targets, $action, $status_cb);
+}
+
+sub print_lun_clone_progress($$$$) {
+    debug_func_entry("print_lun_clone_progress", \@_);
+    my ($job, $action, $status_cb, $error_cb) = @_;
+    my $percent = 0.0;
+
+    if (defined($job->{'percent_completed'})) {
+        $percent = $job->{'percent_completed'};
+    }
+
+    my $percent_str = sprintf("%2.0f", $percent * 100);
+    $status_cb->("LUN $action on " . $job->{'host'} .
+                 " $percent_str% complete. uuid: " . $job->{'job_id'});
+
+    if ($job->{'status'} eq 'failed') {
+        $error_cb->("LUN $action on " . $job->{'host'} .
+                    " failed, uuid: " . $job->{'job_id'});
+    }
+}
+
+# $0 - dict node_id -> node
+sub reboot($) {
+    debug_func_entry("reboot", \@_);
+    my ($nodes) = @_;
+    my $failures = {};
+    my @node_ids = keys %{$nodes};
+    debug(20, "Rebooting nodes @node_ids");
+    nodereboot({'nodelist' => \@node_ids,
+                'asyncmode' => 1}, $failures);
+    return $failures;
+}
+
+# Convert a list of Node objects into a hash of
+# node_ids => Node objects
+sub node_ids_to_nodes($) {
+    debug_func_entry("node_ids_to_nodes", \@_);
+    my ($nodes) = @_;
+    my $node_ids = {};
+
+    foreach my $node (@$nodes) {
+       $node_ids->{$node->node_id()} = $node;
+    }
+
+    return $node_ids;
+}
+
+# Convert a list of node_ids into a list of node objects
+sub node_ids_to_node_objects($) {
+    debug_func_entry("node_ids_to_node_objects", \@_);
+    my ($node_ids) = (@_);
+
+    my $nodes = [];
+
+    for my $node_id (@$node_ids) {
+        my $node = Node->Lookup($node_id);
+        if (defined($node)) {
+            push(@$nodes, $node);
+        } else {
+            debug(10, "No node object found for node_id $node_id");
+        }
+    }
+
+    return $nodes;
+}
+
+sub release_from_pxewait($$$) {
+    debug_func_entry("release_from_pxewait", \@_);
+    my ($update_partitions, $status_cb, $error_cb) = @_;
+
+    while(my ($node_id, $params) = each %$update_partitions) {
+        my $node = $params->[0];
+        my $image = $params->[1];
+        my $osinfo = $params->[2];
+        my $cmdline = $params->[3];
+        update_partitions($node, $image, $osinfo);
+        update_cmdline($node, $cmdline);
+    }
+    return 0;
+}
+
+# Discover which nodes are in a wait state
+#
+# param0: dictionary of node_id => node object
+#
+# returns: dictionary of node_id => node object
+sub nodes_waiting($) {
+    debug_func_entry("nodes_not_waiting", \@_);
+    my ($node_ids) = @_; # $node_ids: dict node_id => node
+    my @node_id_list = keys(%$node_ids);
+    my $eventstate = node_eventstate(\@node_id_list); # query result handle
+    my $waiting = {};
+    my %wait_states = (
+        'BOOTING' => 1,
+        'PXEWAIT' => 1,
+        'PXEBOOTING' => 1,
+        'SHUTDOWN' => 1
+    );
+
+    if (defined($eventstate)) {
+        while (my $row = $eventstate->fetchrow_hashref()) {
+            my $state = $row->{'eventstate'};
+            my $node_id = $row->{'node_id'};
+            debug(10, "$node_id eventstate $state");
+            if (defined($wait_states{$state})) {
+                debug(10, "$node_id waiting");
+                if (defined($node_ids->{$node_id})) {
+                    $waiting->{$node_id} = $node_ids->{$node_id};
+                }
+            } else {
+                debug(10, "$node_id not waiting");
+            }
+        }
+    }
+
+    return $waiting;
+}
+
+# Get node event states from the database
+#
+# param0: list of node_ids
+# returns: a database query result handle
+sub node_eventstate($) {
+    debug_func_entry("node_eventstate", \@_);
+    my ($node_ids) = @_;
+
+    my $query = 'select node_id, eventstate from nodes where node_id = "' . join('" or node_id = "', @$node_ids) . '"';
+    debug(10, "node_eventstate query: $query");
+    return DBQueryWarn($query);
+}
+
+# Create an event handler
+sub create_event_handler($) {
+    debug_func_entry("create_event_handler", \@_);
+    my ($callback) = @_;
+
+    my $port = 16505;
+    my $URL  = "elvin://localhost:$port";
+
+    # Connect to the event system, and subscribe the the events we want
+    my $handle = event_register($URL, 0);
+
+    if (!$handle) {
+        tberror("Unable to register with event system");
+        return undef;
+    }
+
+    my $tuple = address_tuple_alloc();
+    if (!$tuple) {
+        tberror("Could not allocate an address tuple");
+        return undef;
+    }
+
+    %$tuple = ( objtype => TBDB_TBEVENT_NODESTATE(),
+               eventtype => join(", ", TBDB_NODESTATE_SHUTDOWN(),
+                                       TBDB_NODESTATE_RELOADING(),
+                                       TBDB_NODESTATE_PXEWAIT() ) );
+
+    if (!event_subscribe($handle, $callback, $tuple)) {
+        tbinfo("Could not subscribe to events");
+        return undef;
+    }
+
+    tbinfo("Event handler created");
+    return $handle;
+}
+
+sub pxewait_event_handler($$) {
+    debug_func_entry("pxewait_event_handler", \@_);
+    my ($waiting, $not_waiting) = \@_;
+    my @nw = keys %{$not_waiting};
+    debug(20, "2. nodes not waiting: @nw $not_waiting");
+
+    return create_event_handler(
+        sub {
+            my ($handle, $notification, undef) = @_;
+            my $node_id = event_notification_get_objname($handle,
+                                                         $notification);
+            my $event   = event_notification_get_eventtype($handle,
+                                                           $notification);
+
+            my @nw = keys %{$not_waiting};
+            debug(20, "3. nodes not waiting: @nw $not_waiting");
+
+            if(defined($node_id) && defined($event)) {
+                if (defined($not_waiting->{$node_id})) {
+                    $waiting->{$node_id} = $not_waiting->{$node_id};
+                    delete $not_waiting->{$node_id};
+                }
+            }
+       });
+}
+
+sub iscsi_target_list($$$$) {
+    debug_func_entry("iscsi_target_list", \@_);
+    my ($node_ids, $action, $status_handler, $error_handler) = @_;
+    my $node_to_os = node_id_to_osinfo_and_image($node_ids);
+    my $target_sets = {};
+    my $update_partitions = {};
+    my $server_node = {};
+    my $num_errors = 0;
+    my $node_id;
+    my $node;
+
+    debug_node_ids(10, "iscsi_target_list", $node_ids);
+
+    while(($node_id, $node) = each %$node_ids) {
+        # Load this node's type attributes
+        my $node_type = node_type_for_node($node);
+
+        # The disktype for this node
+        my $disktype = $node_type->{'ATTRS'}->{'disktype'}->{'value'};
+
+        my $clone_server;
+        my $rv = 0;
+
+        # Get the osinfo and image for this node
+        my $osinfo = $node_to_os->{$node->node_id()}->{'osinfo'};
+        my $image = $node_to_os->{$node->node_id()}->{'image'};
+
+        if (!defined($osinfo)) {
+            $error_handler->("$node does not have any osinfo, cannot provision node");
+            $num_errors++;
+        }
+
+        if (!defined($image)) {
+            $error_handler->("$node does not have an image, cannot provision node");
+            $num_errors++;
+        }
+
+        if ($num_errors <= 0) {
+            $clone_server = iscsi_server_for_node($node);
+            debug(10, "Clone server: $clone_server");
+
+            $num_errors += check_iscsi_server($clone_server);
+
+            if ($num_errors > 0) {
+                $error_handler->("Errors for iscsi for $node_id");
+            }
+        }
+
+        # Add this node's iSCSI target server and image to the set
+        if ($num_errors <= 0) {
+            my $interface = Interface->LookupControl($clone_server);
+            my $ip = $interface->IP();
+
+            my $params;
+
+            if ($action eq 'create') {
+                $params = lun_create_data($clone_server, $image, $osinfo, $node);
+                my $wwn =  wwn($clone_server, $image, $osinfo, $node);
+                my $cmdline = sanboot($clone_server, $wwn);
+                debug(20, "params: " . Dumper($params));
+                $update_partitions->{$node_id} = [$node, $image, $osinfo, $cmdline];
+            } else {
+                $params = lun_delete_data($clone_server, $image, $osinfo, $node);
+            }
+
+            if (!defined($target_sets->{$ip})) {
+                $target_sets->{$ip} = [$params];
+                $server_node->{$ip} = [$node_id];
+            } else {
+                push(@{$target_sets->{$ip}}, $params);
+                push(@{$server_node->{$ip}}, $node_id);
+            }
+        }
+    }
+
+    if ($num_errors > 0) {
+        return (undef, undef, undef);
+    }
+
+    return ($target_sets, $update_partitions, $server_node);
+}
+
+# Get a node's type and load the node_type attributes
+sub node_type_for_node($) {
+    debug_func_entry("node_type_for_node", \@_);
+    my ($node) = @_;
+
+    # Load this node's type attributes
+    my $node_type = $node->NodeTypeInfo();
+    $node_type->LoadAttributes();
+
+    return $node_type;
+}
+
+# Get the image, osinfo for a list of nodes
+#
+# param0: dict node_id => node object
+#
+# return: {node_id => {'osinfo' => $osinfo, 'image' => $image}}
+sub node_id_to_osinfo_and_image($) {
+    debug_func_entry("node_id_to_osinfo_and_image", \@_);
+    my ($node_ids) = @_;
+    my $num_errors = 0;
+
+    # Cache image and osinfo information to minimize
+    # database lookups
+    my $image_cache = {};
+    my $osinfo_cache = {};
+    my $osid_to_imageid = get_osid_to_imageid_map();
+    my $node_to_os = {};
+    my $node_id;
+    my $node;
+
+    while(($node_id, $node) = each %$node_ids) {
+        my $osinfo = osinfo_for_node($node, $osinfo_cache);
+        my $image  = image_for_osinfo($osinfo, $osid_to_imageid, $image_cache);
+
+        if (!defined($osinfo)) {
+            tberror("$node has no OSinfo");
+        }
+
+        if (!defined($image)) {
+            tberror("$node has no Image");
+        }
+
+        if (defined($image) && defined($osinfo)) {
+            $node_to_os->{$node_id} = {'osinfo' => $osinfo, 'image' => $image};
+        }
+    }
+
+    return $node_to_os;
+}
+
+# Get the mapping of osids to imageids
+sub get_osid_to_imageid_map() {
+    debug_func_entry("get_osid_to_imageid_map", \@_);
+
+    my $query = "select * from osidtoimageid";
+    my $result = DBQueryWarn($query);
+    my $map = {};
+
+    if ($result) {
+        while (my $row = $result->fetchrow_hashref()) {
+            $map->{$row->{'osid'}} = $row->{'imageid'};
+        }
+    } else {
+        tberror("Query failed: $query");
+    }
+
+    return $map;
+}
+
+# Lookup an OSinfo object from the database
+sub osinfo_for_node($$) {
+    debug_func_entry("osinfo_for_node", \@_);
+    my ($node, $cache) = @_;
+    my $osinfo = undef;
+    my $osid = $node->def_boot_osid();
+
+    if (defined($osid)) {
+        if (defined($cache->{$osid})) {
+            $osinfo = $cache->{$osid};
+        } else {
+            $osinfo = OSinfo->Lookup($osid);
+            if (!defined($osinfo)) {
+                tberror("Could not find OSinfo object with id $osid in the DB!");
+            } else {
+                my $num_errors = check_osinfo($osinfo);
+
+                if ($num_errors <= 0) {
+                    $cache->{$osid} = $osinfo;
+                } else {
+                    $osinfo = undef;
+                }
+            }
+        }
+    } else {
+        tberror("$node does not have a def_boot_osid");
+    }
+
+    return $osinfo;
+}
+
+# param0: osinfo object
+# param1: reference to a dictionary that maps osid to imageid. Used to cache this info to avoid multiple lookups
+# param2: Image object cache. Reference to a dictionary that maps imageids to Images
+#
+# returns: the Image object that matches the supplied OSInfo object
+sub image_for_osinfo($$$) {
+    debug_func_entry("image_for_osinfo", \@_);
+    my ($osinfo, $osid_to_imageid, $cache) = @_;
+    my $osid = $osinfo->osid();
+    my $imageid = $osid_to_imageid->{$osid};
+    my $image = undef;
+
+    if (defined($imageid)) {
+        if (defined($cache->{$imageid})) {
+            # Get the image from the cache
+            $image = $cache->{$imageid};
+        } else {
+            $image = Image->Lookup($imageid);
+
+            if (defined($image)) {
+                my $num_errors = check_image($image);
+
+                if ($num_errors <= 0) {
+                    $cache->{$imageid} = $image;
+                } else {
+                    $image = undef;
+                }
+            } else {
+                tberror("Could not find image with imageid $imageid");
+            }
+        }
+    } else {
+        tberror("No matching imageid in osidfromimageid table for osid $osid");
+    }
+
+    return $image;
+}
+
+# Return 1 if image is diskless, 0 otherwise
+sub image_is_diskless($) {
+    debug_func_entry("image_is_diskless", \@_);
+    my ($image) = @_;
+
+    if ($image->format() eq 'zfsiscsi' ||
+        $image->format() eq 'iscsi') {
+        return 1;
+    }
+
+    return 0;
+}
+
+# Get the iscsi server for a node and load that iscsi server's attributes
+sub iscsi_server_for_node($) {
+    debug_func_entry("iscsi_server_for_node", \@_);
+
+    my $node = shift();
+
+    # Get the iSCSI server associated with this node and load its attributes
+    my $iscsi_server_node_id = $node->{'ATTRS'}->{'iscsi_server'}->{'attrvalue'};
+
+    if (!defined($iscsi_server_node_id)) {
+        tbwarn($node->Stringify, " does not have an associated iscsi_server. Perhaps this is not a diskless node? Or an Emulab config error?\n");
+        return undef;
+    }
+
+    my $iscsi_server = Node->Lookup($iscsi_server_node_id);
+
+    if (!defined($iscsi_server)) {
+        tbwarn("Could not lookup iscsi server with node id $iscsi_server_node_id. This might be a diskless Emulab configuration error.\n");
+        return undef;
+    }
+
+    $iscsi_server->LoadNodeAttributes();
+
+    return $iscsi_server;
+}
+
+# TODO: remove, replace with error handler where this function is called
+sub print_error_provisioning_node($) {
+    my $node = shift();
+    tberror($node->Stringify(), " error while provisioning\n");
+}
+
+#----------------------------------------------------------------------------------------------------
+# URIs
+#----------------------------------------------------------------------------------------------------
+
+sub lun_clone_uri($) {
+    debug_func_entry("lun_clone_uri", \@_);
+    my $server = shift();
+    return server_uri_with_format("https://%s/lun/api/v1.0/clone", $server)
+}
+
+sub lun_clone_status_uri($$) {
+    debug_func_entry("lun_clone_status_uri", \@_);
+    my $server = shift();
+    my $id = shift();
+    return server_uri_with_format("https://%s/lun/api/v1.0/clone_status/", $server) . $id;
+}
+
+# Create a URI for the specified server
+#
+# Params:
+#
+# arg[0] - format string, printf style
+# arg[1] - A Node object for the serfver
+#
+# Returns: the formatted URI
+sub server_uri_with_format($$) {
+    debug_func_entry("server_uri_with_format", \@_);
+    my $uri_format = shift();
+    my $server = shift();
+
+    return sprintf($uri_format, $server);
+}
+
+#----------------------------------------------------------------------------------------------------
+# REST functions
+#----------------------------------------------------------------------------------------------------
+
+sub lun_clone_status($$$$) {
+    debug_func_entry("lun_clone_status", \@_);
+    my ($clone_server, $job_id, $status_cb, $error_cb) = @_;
+    my $uri = lun_clone_status_uri($clone_server, $job_id);
+    return rest_endpoint('GET', $uri, {}, $error_cb);
+}
+
+sub print_lun_clone_status($$$$) {
+    debug_func_entry("print_lun_clone_status", \@_);
+    my ($server, $status, $action, $progress_cb);
+    $progress_cb->("LUN $action on $server " . $status->{'job_id'} . ' ' . $status->{'percent_completed'} * 100 . '% complete');
+}
+
+sub lun_clone($$$) {
+    debug_func_entry("lun_clone", \@_);
+    my ($targets, $action, $status, $error) = @_;
+
+    my $jobs = {};
+
+    my $method = 'POST';
+    if ($action ne 'create') {
+        $method = 'DELETE';
+    }
+
+    foreach my $clone_server (keys(%$targets)) {
+        $status->("Starting LUN $action job on $clone_server");
+        my $lun_clone_uri = lun_clone_uri($clone_server);
+        my $job = rest_endpoint( $method, $lun_clone_uri, { # REST function parameters
+            'clones' => $targets->{$clone_server}
+        }, $error);
+        # Key / value pairs in $job:
+        # status => ok, error
+        # job_id => uuid of job
+        $jobs->{$clone_server} = $job->{'job_id'};
+    }
+
+    return $jobs;
+}
+
+# Create hash for creating a LUN
+sub lun_create_data($$$$$) {
+    debug_func_entry("lun_create_data", \@_);
+    my $clone_server = shift();
+    my $image = shift();
+    my $osinfo = shift();
+    my $node = shift();
+
+    return {
+        'src'          => snapshot($clone_server, $image, $osinfo),
+        'dst'          => dest_clone($clone_server, $image, $osinfo, $node),
+        'wwn'          => wwn($clone_server, $image, $osinfo, $node),
+        'createParent' => 1,
+        'initiators'   => initiators([$node]),
+    };
+}
+
+sub lun_delete_data($$$$) {
+    my $clone_server = shift();
+    my $image = shift();
+    my $osinfo = shift();
+    my $node = shift();
+
+    return {
+        'dst'          => dest_clone($clone_server, $image, $osinfo, $node),
+        'wwn'          => wwn($clone_server, $image, $osinfo, $node),
+        'deleteClones' => 1,
+    }
+}
+
+#----------------------------------------------------------------------------------------------------
+# REST support functions
+#----------------------------------------------------------------------------------------------------
+
+# Make a call to a REST endpoint
+sub rest_endpoint($$$$) {
+    debug_func_entry("rest_endpoint", \@_);
+    my ($method, $uri, $params, $error_cb) = @_;
+
+    my $json = encode_json($params);
+
+    # Create HTTP request for the REST endpoint, include function parameters
+    my $req = HTTP::Request->new($method, $uri);
+    $req->header('Content-Type' => 'application/json');
+    $req->content($json);
+
+    # Get a HTTPS user agent that uses client side certs
+    my $ua = user_agent();
+
+    # Make the request
+    my $res = $ua->request($req);
+
+    my $content = $res->content();
+
+    my $retval = decode_json($res->content());
+
+    # Handle errors
+    if ($res->code != 201) {
+        tberror($res->decoded_content);
+
+        # Report back with a command that the sysadmin could execute to troubleshoot the issue
+        $error_cb->("\nTroubleshoot with: curl -s -k --key $ssl_key_file --cert $ssl_crt_file -X $method -H 'Content-Type: application/json' -d '$json' $uri\n");
+    }
+
+    return $retval;
+}
+
+# Create a user agent
+sub user_agent() {
+    my $ua = LWP::UserAgent->new(
+        keep_alive => undef,
+        timeout => $http_timeout,
+        ssl_opts => {
+            verify_hostname => 0,
+            SSL_cert_file => $ssl_crt_file,
+            SSL_key_file => $ssl_key_file,
+        },
+    );
+
+    return $ua;
+}
+
+#----------------------------------------------------------------------------------------------------
+# Database sanity checks
+#----------------------------------------------------------------------------------------------------
+
+# Verify that an Image object can be used in the diskless
+# provisioning process
+#
+# $0 - The Image object
+#
+# Returns: the number of errors that occurred during the check
+sub check_image($) {
+    debug_func_entry("check_image", \@_);
+    my $image = shift();
+    my $num_errors = 0;
+
+    if (!defined($image)) {
+        tberror("Attempt to use undefined value for an image");
+        return 1;
+    }
+
+    # Project ID for the image
+    my $pid = $image->pid;
+
+    # Snapshot number
+    my $snapshot = $image->version();
+
+    if (!defined($pid)) {
+        tberror($image->Stringify(), " no pid for image");
+        $num_errors++;
+    }
+
+    if (!defined($snapshot)) {
+        tberror($image->Stringify(), " diskless Emulab configuration error. The image does not have a version");
+        $num_errors++;
+    }
+
+    if (image_is_diskless($image) == 0) {
+        tberror($image->Stringify(), " is not a diskless images. Expected image_version format to be iscsi or zfsiscsi");
+        $num_errors++;
+    }
+
+    return $num_errors;
+}
+
+# Verify that an Node object that represents an iSCSI server
+# can be used in the diskless provisioning process
+#
+# $0 - The Node object
+#
+# Returns: the number of errors that occurred during the check
+sub check_iscsi_server($) {
+    debug_func_entry("check_iscsi_server", \@_);
+    my $server = shift();
+    my $num_errors = 0;
+
+    if (!defined($server)) {
+        tberror("Attempt to use undefined value for a iSCSI server in check_iscsi_server()");
+        return 1;
+    }
+
+    my $iface = Interface->LookupControl($server);
+    my $ip = undef;
+
+    if (!defined($iface)) {
+        tberror($server->Stringify(), " diskless Emulab configuration error. The iSCSI server does not have a control interface defined. Make sure that entries in the interfaces and interface_state table exist for this server");
+        $num_errors++;
+    } else {
+        $ip = $iface->IP();
+    }
+
+    # ZFS pool
+    my $pool = $server->{'ATTRS'}->{'pool'}->{'attrvalue'};
+
+    # Base IQN for the iSCSI server
+    my $base_iqn = $server->{'ATTRS'}->{'base_iqn'}->{'attrvalue'};
+
+    # Portal IP for iscsi server
+    my $portal_ip = $server->{'ATTRS'}->{'portal_ip'}->{'attrvalue'};
+
+    # Portal port for the iscsi server
+    my $portal_port = $server->{'ATTRS'}->{'portal_port'}->{'attrvalue'};
+
+    if (!defined($pool)) {
+        tberror($server->Stringify(), " diskless Emulab configuration error. The pool attribute is undefined for this iSCSI server.");
+        $num_errors++;
+    }
+
+    if (!defined($base_iqn)) {
+        tberror($server->Stringify(), " diskless Emulab configuration error. The base_iqn attribute is undefined for this iSCSI server.");
+        $num_errors++;
+    }
+
+    if (!defined($portal_ip)) {
+        tberror($server->Stringify(), " diskless Emulab configuration error. The portal_ip attribute is undefined for this iSCSI server.");
+        $num_errors++;
+    }
+
+    if (!defined($portal_port)) {
+        tberror($server->Stringify(), " diskless Emulab configuration error. The portal_port attribute is undefined for this iSCSI server.");
+        $num_errors++;
+    }
+
+    if (!defined($ip)) {
+        tberror($server->Stringify(), " diskless Emulab configuration error. The iSCSI server's control interface does not have an IP address");
+        $num_errors++;
+    }
+
+    return $num_errors;
+}
+
+# Check the nodes prior to iSCSI provisioning. This verifies the integrity
+# of the Emulab database for all # nodes in an experiments.
+#
+# $0 - a reference to a the list of Node objects in the experiment
+sub check_nodes($) {
+    debug_func_entry("check_nodes", \@_);
+    # Array of node uuids
+    my $nodes = shift();
+    # Number of nodes that have failed
+    my $num_node_failures = 0;
+    tbinfo ("Checking Emulab db state for diskless nodes @$nodes");
+
+    # Number of errors that have occurred while provisioning
+    # this node
+    my $num_errors = 0;
+
+    foreach my $node (@$nodes) {
+        $num_errors += check_node($node);
+    }
+
+    if ($num_errors > 0) {
+        tberror("Errors with nodes in Emulab DB, cannot run experiment");
+    }
+
+    return $num_errors;
+}
+
+# Verify that a Node object can be used in the diskless provisioning process
+#
+# $0 - The Node object
+#
+# Returns: the number of errors that occurred during the check
+sub check_node($) {
+    debug_func_entry("check_node", \@_);
+    my $node = shift();
+    my $num_errors = 0;
+
+    if (!defined($node)) {
+        tberror("Attempt to use undefined value for a node in check_node()");
+        return 1;
+    }
+
+    # Load this node's corresponding iscsi server node and its attributes
+    # Populate $node_object->{'ATTRS'}
+    $node->LoadNodeAttributes();
+
+    # Populate $node_object->{'RSRV'}
+    $node->IsReserved();
+
+    # Project ID for the node
+    my $pid = $node->{'RSRV'}->{'pid'};
+
+    # Experiment ID for the node
+    my $eid = $node->{'RSRV'}->{'eid'};
+
+    # Node name, not the physical name, but the experiment node name
+    my $node_name = $node->{'RSRV'}->{'vname'};
+
+    # Node initiator name
+    my $initiator_name = $node->{'ATTRS'}->{'initiator_name'}->{'attrvalue'};
+    # Node iscsi server
+    my $iscsi_server = $node->{'ATTRS'}->{'iscsi_server'}->{'attrvalue'};
+
+    if (!defined($pid)) {
+        tberror($node->Stringify(), " no pid for node");
+        $num_errors++;
+    }
+
+    if (!defined($eid)) {
+        tberror($node->Stringify(), " no eid for node");
+        $num_errors++;
+    }
+
+    if (!defined($node_name)) {
+        tberror($node->Stringify(), " no vname for node");
+        $num_errors++;
+    }
+
+    if (!defined($initiator_name)) {
+        tberror($node->Stringify(), " diskless Emulab configuration error. This node does not have an initiator_name attribute in the node_attributes table");
+        $num_errors++;
+    }
+
+    if (!defined($iscsi_server)) {
+        tberror($node->Stringify(), " diskless Emulab configuration error. This node does not have an iscsi_server attribute in the node_attributes table");
+        $num_errors++;
+    }
+
+    return $num_errors;
+}
+
+# Verify that an OSinfo object can be used in the diskless
+# provisioning process
+#
+# $0 - The OSinfo object
+#
+# Returns: the number of errors that occurred during the check
+sub check_osinfo($) {
+    debug_func_entry("check_osinfo", \@_);
+    my $osinfo = shift();
+    my $num_errors = 0;
+
+    if (!defined($osinfo)) {
+        tberror("Attempt to use undefined value for an osinfo");
+        return 1;
+    }
+
+    # Image name
+    my $osname = $osinfo->osname;
+
+    if (!defined($osname)) {
+        tberror($osinfo->Stringify(), " does not have an osname");
+        $num_errors++;
+    }
+
+    return $num_errors;
+}
+
+#----------------------------------------------------------------------------------------------------
+# MISC
+#----------------------------------------------------------------------------------------------------
+
+sub error_handler($) {
+    my ($errors) = @_;
+
+    if (defined($errors)) {
+        tberror(Dumper($errors));
+    }
+}
+
+sub debug_func_entry($$) {
+    my $func = shift();
+    my $args = shift();
+#    debug(10, "FUNCTION $func(" . join(',', Dumper($args)) . ")");
+    debug(10, "FUNCTION $func(" . join(',', $args) . ")");
+}
+
+sub debug($$) {
+    my $level = shift();
+    my $msg = shift();
+
+    if ($level <= $debug_level) {
+        print ("DEBUG[$level]: $msg\n");
+    }
+}
+
+sub debug_node_ids($$$) {
+    my ($level, $prefix, $node_ids) = @_;
+    my $message = "$prefix: ";
+    my $node_id;
+    my $node;
+
+    while(($node_id, $node) = each %$node_ids) {
+        $message = $message . "$node_id: $node, ";
+    }
+
+    debug($level, $message);
+}
+
+# Take an Emulab formatted mac address, which contains no colons,
+# and add the colons.
+sub insert_colons_for_mac($) {
+    my $mac_no_colons = shift();
+    my $mac_with_colons = $mac_no_colons;
+    if ($mac_no_colons =~ /([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/) {
+        $mac_with_colons = "$1:$2:$3:$4:$5:$6";
+    }
+    return $mac_with_colons;
+}
+
+# Build the name of a ZFS snapshot using the iSCSI server, image
+# and osinfo
+#
+# $0 - iSCSI server, type Node
+# $1 - image, type Image
+# $2 - osinfo, type OSinfo
+#
+# Returns: the name of the ZFS snapshot
+sub snapshot($$$) {
+    my $server = shift();
+    my $image = shift();
+    my $osinfo = shift();
+
+    # The source snapshot
+    return sprintf("%s/projects/%s/images/%s@%s",
+        # ZFS pool
+        $server->{'ATTRS'}->{'pool'}->{'attrvalue'},
+        # Project ID for the image
+        $image->pid,
+        # Name of the image
+        $osinfo->osname,
+        # Snapshot number
+        $image->version());
+}
+
+# Build the name of the destination clone for a node
+# in an experiment
+#
+# $0 - iSCSI server, type Node
+# $1 - image, type Image
+# $2 - osinfo, type OSinfo
+# $3 - node, type Node
+#
+# Returns: the destination clone
+sub dest_clone($$$$) {
+    my $server = shift();
+    my $image = shift();
+    my $osinfo = shift();
+    my $node = shift();
+
+    # format is zfs pool / projects / pid / eid / nodes / node vname . osname . version
+    return lc(sprintf("%s/projects/%s/%s/nodes/%s.%s.%s",
+        # ZFS pool
+        $server->{'ATTRS'}->{'pool'}->{'attrvalue'},
+        # Project ID for the node
+        $node->{'RSRV'}->{'pid'},
+        # Experiment ID for the node
+        $node->{'RSRV'}->{'eid'},
+        # Node name, not the physical name, but the experiment node name
+        $node->{'RSRV'}->{'vname'},
+        # Image name
+        $osinfo->osname,
+        # Snapshot number
+        $image->version()));
+}
+
+# Create the target wwn for a node in the experiment
+sub wwn($$$$) {
+    my $server = shift();
+    my $image = shift();
+    my $osinfo = shift();
+    my $node = shift();
+
+    # The wwn for the iSCSI LUN
+    return lc(sprintf("%s:%s.%s.%s.%s.%s",
+        # Base IQN for the iSCSI server
+        $server->{'ATTRS'}->{'base_iqn'}->{'attrvalue'},
+        # Project ID for the node
+        $node->{'RSRV'}->{'pid'},
+        # Experiment ID for the node
+        $node->{'RSRV'}->{'eid'},
+        # Node name, not the physical name, but the experiment node name
+        $node->{'RSRV'}->{'vname'},
+        # Image name
+        $osinfo->osname,
+        # Snapshot number
+        $image->version()));
+}
+
+# Return an array of initiator names for the supplied nodes.
+sub initiators($$) {
+    my ($server_nodes) = @_;
+    my $node = shift();
+
+    my $initiator_names = [];
+
+    for my $node (@$server_nodes) {
+        push(@$initiator_names, $node->{'ATTRS'}->{'initiator_name'}->{'attrvalue'});
+    }
+
+    return $initiator_names;
+}
+
+# Sanboot command line for iPXE
+sub sanboot($$) {
+    my $server = shift();
+    my $wwn  = shift();
+
+    my $iface = Interface->LookupControl($server);
+    my $ip = $iface->IP();
+
+    return sprintf("iscsi:%s::::%s", $ip, $wwn);
+}
+
+sub update_cmdline($$) {
+    debug_func_entry("update_cmdline", \@_);
+    my $node = shift();
+    my $cmdline = shift();
+
+    my $node_id = $node->node_id();
+
+    if (!DBQueryWarn("update nodes set ".
+                     "def_boot_cmd_line='$cmdline' ".
+                     "where node_id='$node_id'")) {
+        tbwarn "$node: Could not update command line to '$cmdline'";
+    }
+}
+
+sub update_partitions($$$) {
+    debug_func_entry("update_partitions", \@_);
+    my ($node, $image, $osinfo) = @_;
+
+    my $query = sprintf("replace into partitions (node_id,  partition, osid, imageid, imagepid) values ('%s', '%s', '%s', '%s', '%s')",
+        $node->node_id(),
+        $image->loadpart(),
+        $osinfo->osid(),
+        $image->imageid(),
+        $osinfo->pid());
+
+    debug(10, "update_partitions query: $query");
+    DBQueryWarn($query);
+}
+
+# Get the fully qualified domain name for a node
+sub fqdn_for_node($) {
+    my $node = shift();
+
+    return sprintf("%s.%s.%s.%s",
+        # Node name, not the physical name, but the experiment node name
+        $node->{'RSRV'}->{'vname'},
+        # Experiment ID
+        $node->{'RSRV'}->{'eid'},
+        # Project id
+        $node->{'RSRV'}->{'pid'},
+        # Domain name
+        $OURDOMAIN,
+        );
+}
+
+# Clear a nodes state and reservation
+sub clear_node_state($) {
+    my $node = shift();
+    # This is such a hack. This function should go away and the node should progress through a set of valid state changes to reach
+    # a clear state. This was placed here in an effort to get diskless emulab up and running.
+    DBQueryWarn("update nodes set op_mode = 'PXEKERNEL', allocstate = 'FREE_DIRTY', eventstate = 'PXEWAIT' where node_id = '$node->node_id()'");
+    DBQueryWarn("delete from reserved where node_id = '$node'");
+}
+
+#
+# Update the root_luns table with the dst and wwn parameters
+# for the root partition lun
+#
+# $0 - node_id
+# $1 - file server
+# $2 - dst clone on the file server
+# $3 - wwn of the iscsi target
+sub update_root_lun($$$) {
+    debug_func_entry("update_root_lun", \@_);
+    my ($node_id, $file_server, $dst, $wwn) = @_;
+    my $table = "root_luns";
+
+    # Check for existing entry
+    my $query = "select count(*) as c from root_luns where node_id = '$node_id'";
+    my $result = DBQueryWarn($query);
+
+    if (defined($result)) {
+        my $row = $result->fetchrow_hashref();
+
+        if (defined($row)) {
+            my $count = $result->{'c'};
+
+            if (defined($count)) {
+                # We could use replace into, but it deletes the existing row, and since there's a primary key,
+                # the index has to be rebalanced, which can be expensive for large tables. This is likely a small
+                # table, but I'd prefer to not get into the habit.
+                if ($count > 0) {
+                    $query = "update root_luns set file_server = '$file_server', wwn = '$wwn', dst = '$dst' where node_id = '$node_id'";
+                    DBQueryWarn($query);
+                } else {
+                    $query = "insert into root_luns (node_id, file_server, wwn, dst) values ('$node_id', '$file_server', '$wwn', '$dst')";
+                    DBQueryWarn($query);
+                }
+            }
+        }
+    }
+}
+
+# Subtract a set from another set
+#
+# $0 - dict ref: the lhs of the subtraction
+# $1 - dict ref: the rhs of the subtraction
+#
+# Returns: dict ref of $0 - $1
+sub set_subtract($$) {
+    my ($lhs, $rhs) = @_;
+    my $result = {};
+    foreach my $lhs_key (keys %{$lhs}) {
+        # Check to see if the key is in both dictionaries. If not,
+        # then it will be in the result set
+        if (!defined($rhs->{$lhs_key})) {
+            $result->{$lhs_key} = $lhs->{$lhs_key};
+        }
+    }
+
+    return $result;
+}
+
+# Add a set from another set
+#
+# $0 - dict ref: the lhs of the addition
+# $1 - dict ref: the rhs of the addition
+#
+# Returns: dict ref of $0 + $1
+#
+# Side effect: the result set will have the rhs objects if the key
+# exists in both sets
+sub set_add($$) {
+    my ($lhs, $rhs) = @_;
+
+    my $result = {};
+    foreach my $key (keys %{$lhs}) {
+        $result->{$key} = $lhs->{$key};
+    }
+
+    foreach my $key (keys %{$rhs}) {
+        $result->{$key} = $rhs->{$key};
+    }
+
+    return $result;
+}
+
+sub print_set($) {
+    my $set = shift();
+    my @keys = keys %$set;
+    print ("@keys");
+}
+
+1;
+
+__END__
+
+=head1 NAME
+
+libdiskless - interface for provisioning diskless Emulab nodes
+
+=head1 SYNOPSIS
+
+use libdiskless;
+
+provision_diskless_nodes($nodeobj_arrayref);
+deprovision_diskless_nodes($nodeobj_arrayref);
+
+=head1 DESCRIPTION
+
+This modules implements an interface for provisioning diskless nodes for the
+Emulab total network testbed
+
+=head1 METHODS
+
+=head2 provision_diskless_nodes ( nodes )
+
+Provision a set of diskless nodes
+
+=over
+
+=item B<nodes>: an arrayref of Node objects to be provisioned
+
+=item B<return>: the number of errors that occurred during the
+provisioning process
+
+=back
+
+=head2 deprovision_diskless_nodes ( node_ids )
+
+Deprovision a set of diskless nodes
+
+Note: this takes a list of node_ids and not a list of Nodes, like
+C<provision_diskless_nodes>. This is because Emulab internally uses Nodes
+for provisioning and node_ids for deprovisioning.
+
+=over
+
+=item B<nodes>: an arrayref of node ids to be deprovisioned
+
+=item B<return>: the number of errors that occurred during the
+deprovisioning process
+
+=back
+
+=head1 PRIVATE METHODS
+
+These methods are documented here for internal development
+
+=head2 dest_clone( server, image, osinfo, node )
+
+Build the name of the destination clone for a node in an experiment
+
+B<server>: reference to Node object for the target LUN server
+
+B<image>: reference to Image object for the image to be used for this node
+
+B<osinfo>: reference to OSInfo object
+
+B<node>: reference to Node object that needs a LUN provisioned
+
+B<Return>: the path to the destination clone
+
+=head2 insert_colons_for_mac( mac_no_colons)
+
+Takes an Emulab formatted mac address, which contains no colons, and adds the
+colons.
+
+B<mac_no_colons>: Emulab colon-less formatted mac address
+
+B<Return>: Mac address broken up into 6 octets separate by colons
+
+=head2 iscsi_target_list ( node_ids, action, status handler, error handler )
+
+Create a list of iscsi targets for a set of nodes
+
+B<node_ids>: an array reference of node id strings
+
+B<action>: a string, either 'create' or 'delete'. Results for other values are
+undefined
+
+B<status handler>: reference to a function to print status reports. This
+function should take one string argument
+
+B<error handler>: reference to a function to print error reports. This function
+should take one string argument
+
+B<Return>: (target sets, update partitions, server_node)
+
+B<target sets>: dictionary reference that can be passed to lun_clone. Key /
+value pairs:
+
+=over
+
+B<key>: hostname or IP address of target LUN server
+
+B<value>: arrayref of dictionary references as returned from B<lun_create_data>
+or B<lun_delete_data>
+
+=back
+
+B<update partitions> is an dictionary reference used to update the partitions
+table in the tbdb MySQL database. Key / value pairs:
+
+=over
+
+B<key>: node id string
+
+B<value>: tuple:
+
+=over
+
+B<node>: reference to a Node object
+
+B<image>: reference to Image object
+
+B<osinfo>: reference to OSInfo object
+
+B<cmdline>: command line for iPXE sanboot.
+
+=back
+
+=back
+
+B<server_node>: a dictionary reference that maps target server hostname to a
+list of nodes. Key / value pairs:
+
+=over
+
+B<key>: hostname or IP address of target LUN server
+
+B<value>: arrayref of node ids that whose target LUNs reside on this server
+
+=back
+
+=head2 lun_clone ( targets, action, status_handler, error_handler )
+
+Starts the creation or deletion of LUN clones on target servers
+
+B<targets>: dictionary reference: Key / value pairs:
+
+=over
+
+B<key>: hostname or IP address of target LUN server
+
+B<value>: arrayref of dictionary references as returned from B<lun_create_data>
+or B<lun_delete_data>
+
+=back
+
+B<action>: a string, either 'create' or 'delete'. Results for other values are undefined
+
+B<status handler>: reference to a function to print status reports. This function should take one string argument
+
+B<error handler>: reference to a function to print error reports. This function should take one string argument
+
+B<Returns>: A dictionary reference. Key / value pairs:
+
+=over
+
+B<key>: hostname or ip address
+
+B<value>: the returned job_id from the LUN target server
+
+=back
+
+=head2 lun_clone_status ( server, job_id )
+
+Get the status of a LUN clone create / delete job from a server
+
+B<server>: IP address or hostname
+
+B<job_id>: The UUID of the job
+
+B<Return>: dictionary reference with key / value pairs:
+
+=over
+
+B<status>: complete, in_progress, failed
+
+B<udevd_time>: Time in seconds spent waiting on udevd
+
+B<num_targets>: Number of targets in job
+
+B<job_type>: delete or create
+
+B<num_clones>: number of clones
+
+B<num_requested>: number requested
+
+B<num_completed>: number of clones completed
+
+B<target_time>: Time spent creating targets in seconds
+
+B<clone_time>: Time spent creating clones in seconds
+
+B<lag_time>: Time waiting in the queue
+
+B<percent_completed>: percent of job that is complete (0-1)
+
+B<job_time>: total time in seconds
+
+=back
+
+=head2 lun_create_data ( clone_server, image, osinfo, node)
+
+Takes an Emulab node, osinfo and image objects and creates a set of parameters
+suitable for using in the REST LUN creation call for the provisioning subsystem
+
+B<clone_server>: reference to a Node object that represents the LUN target server
+
+B<image>: reference to an Image object
+
+B<osinfo>: reference to an OSInfo object
+
+B<node>: reference to the Node object that needs to have a LUN created
+
+B<Return>: A reference to a dictionary. Key / value pairs:
+
+=over
+
+B<src>: path to the source snapshot to use when building the LUN
+
+B<dst>: path to the destination of the clone
+
+B<wwn>: the WWN of the LUN to be created
+
+B<createParent>: always 1. Parent datasets in the dst parameter will be created
+
+B<initiators>: arrayref of IQNs that are allowed to access this LUN.
+
+=back
+
+
+=head2 lun_delete_data ( clone_server, image, osinfo, node)
+
+Takes an Emulab node, osinfo and image objects and creates a set of parameters
+suitable for using in the REST LUN creation call for the provisioning subsystem
+
+B<clone_server>: reference to a Node object that represents the LUN target server
+
+B<image>: reference to an Image object
+
+B<osinfo>: reference to an OSInfo object
+
+B<node>: reference to the Node object that needs to have a LUN deleted
+
+B<Return>: A reference to a dictionary. Key / value pairs:
+
+=over
+
+B<dst>: path to the destination of the clone
+
+B<wwn>: the WWN of the LUN to be created
+
+B<deleteClones>: always 1. Clones are always deleted.
+
+=back
+
+=head2 nodes_waiting ( node_ids )
+
+Query the tbdb database to discover which nodes are already in a wait state
+
+B<node_ids>: array reference of node ids
+
+B<Return>: dictionary reference of nodes that are waiting. Key / value pairs:
+
+=over
+
+B<key>: node_id string
+
+B<value>: node_id string
+
+=back
+
+=head2 print_lun_clone_status ( server, status, action, status_cb, error_cb )
+
+Print out status for a LUN clone job
+
+B<server>: The hostname of the IP address of the server
+
+B<status>: Status as returned from lun_clone_status
+
+B<action>: a string, either 'create' or 'delete'. Results for other values are undefined
+
+B<status_cb>: reference to a function to print status reports. This function should take one string argument
+
+B<error_cb>: reference to a function to print error reports. This function should take one string argument
+
+=head2 provision_luns ( nodes, action, status_handler, error_handler )
+
+Provision or deprovision LUNs for a set of nodes. This function takes the list
+of nodes, places them into PXEWAIT, provisions the LUNs, then updates the
+partitions and nodes table in the tbdb database so that the nodes can boot
+from the iSCSI LUN.
+
+B<nodes>: an arrayref of node objects
+
+B<action>: a string, either 'create' or 'delete'. Results for other values are undefined
+
+B<status handler>: reference to a function to print status reports. This function should take one string argument
+
+B<error handler>: reference to a function to print error reports. This function should take one string argument
+
+B<Return>: arrayref of Node objects that failed the provisioning process
+
+=head2 rest_endpoint ( method, uri, params, error_handler )
+
+Make a REST call using a dictionary that represents a JSON that will be passed
+to the REST endpoint. This is a synchronous call. If the request generates an
+error, error_handler will be called with an error string
+
+B<method>: HTTP method, GET, POST, DELETE, etc.
+
+B<uri>: The URI of the request
+
+B<params>: The parameters that represent the JSON to be passed to the endpoint
+
+B<error handler>: reference to a function to print error reports. This function should take one string argument
+
+B<Return>: A dictionary of the returned JSON
+
+=head2 sanboot ( server, wwn )
+
+Sanboot command line for iPXE. Used to update the def_boot_cmdline in the
+nodes table
+
+B<server>: Target LUN server
+
+B<wwn>: WWN of the LUN to sanboot
+
+B<Return>: The command line to put into the nodes table
+
+=head2 snapshot ( target_server, image, osinfo )
+
+Build the name of a ZFS snapshot using the iSCSI server Node, Image object,
+and OSInfo object
+
+B<target_server>: a reference to a target LUN server Node object
+
+B<image>: a reference to an Image object
+
+B<osinfo>: a reference to an OSInfo object
+
+B<Return>: the name of the snapshot to use to create the LUN clone
+
+=head2 start_provision_job ( nodes, action, status_handler, error_handler )
+
+Start a LUN provisioning job for a set of nodes. This function figures out
+which LUN target servers to contact and starts jobs for either creating or
+deleting LUNs. The job ids for each server are returned. To find find the
+status of these jobs, call B<lun_clone_status> with the target server's IP
+or hostname, and the job id.
+
+B<nodes>: an arrayref of node objects
+
+B<action>: a string, either 'create' or 'delete'. Results for other values are undefined
+
+B<status handler>: reference to a function to print status reports. This function should take one string argument
+
+B<error handler>: reference to a function to print error reports. This function should take one string argument
+
+B<Return>: dictionary reference. Key / value pairs:
+
+=over
+
+B<key>: hostname of IP of target LUN server
+
+B<value>: job id for the LUN create or delete job
+
+=back
+
+=head2 wwn ( server, image, osinfo, node )
+
+Create a WWN
+
+B<server>: reference to a Node object for the target LUN server
+
+B<image>: reference to an Image object
+
+B<osinfo>: reference to an OSInfo object
+
+B<node>: reference to Node object that is being provisioned
+
+B<Return>: The WWN as a string for this server, image, osinfo and node combination
+
+=head1 AUTHOR
+
+Jeff Bowles <jbowles@newmexicoconsortium.org>
+
+=head1 COPYRIGHT
+
+Copyright (c) 2000-2016 University of Utah and the Flux Group.
+
+This file is part of the Emulab network testbed software.
+
+This file is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version.
+
+This file is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this file.  If not, see <http://www.gnu.org/licenses/>.
+
+=cut

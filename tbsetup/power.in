@@ -53,6 +53,7 @@ use power_whol;
 use power_ilo;
 use power_icebox;
 use power_apc;
+use power_ibm_bch;
 use power_racktivity;
 use power_ue;
 use libtestbed;
@@ -435,6 +436,20 @@ foreach my $power_id (keys %outlets) {
 		$errors++;
 	    }
 	}
+    }
+    elsif ($type eq "IBM_BCH") {
+        my $device = new snmpit_ibm_bch($IP,$verbose);
+        if (!defined $device) {
+            warn "Unable to contact controller for $nodestr. Skipping...\n";
+            next;
+        } else {
+            print "Calling device->power($op,@outlets)\n"
+                if $verbose > 1;
+            if ($device->power($op,@outlets)) {
+                print "Control of $nodestr failed.\n";
+                $errors++;
+            }
+        }
     } elsif ($type eq "RACKTIVITY") {
         my $device = new power_racktivity($IP,$verbose);
         if (!defined $device) {

@@ -1,0 +1,292 @@
+#!/usr/local/bin/python
+# ------------------------------------------------------------------------------
+# Copyright (c) 2014-2016 New Mexico Consortium
+#
+# {{{EMULAB-LICENSE
+#
+# This file is part of the Emulab network testbed software.
+#
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+#
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+#
+# }}}
+# ------------------------------------------------------------------------------
+
+
+import sys
+
+sys.path.append('/usr/testbed/lib')
+
+import os
+
+from tbevent import *
+
+from diskless.db import EmulabMySQLdb
+from diskless.db import Image
+from diskless.db import Interface
+from diskless.db import Reserved
+from diskless.db import Node
+from diskless.log import Log
+
+# Default values
+port = ""
+boss_ip = "@BOSSNODE_IP@"
+
+delay = 7
+
+prog_name = 'boot.py'
+
+debug = 0
+# Log handler
+log = None
+
+
+def state_change(boss_ip, state, suffix=None):
+    '''Send a state change event to the Emulab event subsystem'''
+    event_state_var = '%s_sent' % state
+    imgfetch_cmd = 'imgfetch --name state http://%s/event.py?state=%s' % \
+                   (boss_ip, state)
+
+    skip_label = 'skip_set_%s' % state
+
+    if suffix is not None:
+        skip_label = skip_label + '_%s' % suffix
+
+    # if state != 'PXEWAIT':
+    print('iseq ${current_state:string} %s && goto %s ||' %
+          (state, skip_label))
+    print(imgfetch_cmd)
+    print('sleep %s' % delay)
+    print('set current_state %s' % state)
+    print(':%s' % skip_label)
+
+
+def state_change_old(boss_ip, state):
+    '''Send a state change event to the Emulab event subsystem'''
+    event_state_var = '%s_sent' % state
+    imgfetch_cmd = 'imgfetch --name state http://%s/event.py?state=%s' % \
+                   (boss_ip, state)
+
+    print('iseq ${current_state} %s && goto current_state_%s ||' %
+          (state, state))
+    print(':set_state_%s' % state)
+    ipxe_debug('echo setting state %s' % state)
+    print('isset ${%s} || %s' % (event_state_var, imgfetch_cmd))
+    print('isset ${%s} || sleep %s' % (event_state_var, delay))
+    print('isset ${%s} || set %s 1' % (event_state_var, event_state_var))
+    print('set ${current_state} %s' % state)
+    print(':current_state_%s' % state)
+
+
+def ipxe_debug(cmd):
+    if debug:
+        print(cmd)
+
+
+def ipxe_header():
+    '''Print iPXE header'''
+    print('Content-Type: text/plain;charset=utf-8')
+    print
+    print('#!ipxe')
+
+
+# ------------------------------------------------------------------------------
+# iPXE script
+# ------------------------------------------------------------------------------
+def ipxe_script(node):
+
+    initiator_name = node.iscsi_initiatorname
+
+    if initiator_name is None:
+        message = 'Node %s does not have an initiator name, cannot boot iscsi diskless.' % node.node_id
+        print ('echo %s' % message)
+        log.critical(message)
+        return
+
+    ipxe_header()
+
+    # Initial dhcp, if fails, goto 0_retry_dhcp
+    print(':0_dhcp')
+    ipxe_debug('echo Sending DHCP request')
+    print('sleep %s' % delay)
+    # print('ifconf -c dhcp net0 || goto 0_dhcp')
+    print('dhcp || goto 0_dhcp')
+    state_change(boss_ip, 'PXEBOOTING')
+    print('goto 0_bootinfo')
+
+    # Bootinfo
+    print(':0_bootinfo')
+    # print('bootinfo %s || goto 0_retry_bootinfo' % (boss_ip))
+    # Ugly hack to deal with bug in iPXE bootinfo implementation
+    # The bug causes bootinfo report failure at some point. Perhaps
+    # its actually a bug in iPXE, dunno. Regardless, this gets the machine
+    # rebooted and requesting bootinfo again
+    print('bootinfo %s || reboot' % (boss_ip))
+    bootinfo_vars = ['bibootwhat_cmdline', 'bibootwhat_part', 'bibootwhat_mfs',
+                     'bibootwhat_type_part', 'bibootwhat_type_wait',
+                     'bibootwhat_type_reboot', 'bibootwhat_type_auto']
+    for bootinfo_var in bootinfo_vars:
+        ipxe_debug('echo bootinfo %s: ${%s}' % (bootinfo_var, bootinfo_var))
+    print('goto 0_received_bootinfo')
+
+    print(':reboot')
+    ipxe_debug('echo rebooting')
+    state_change(boss_ip, 'SHUTDOWN')
+    print('reboot')
+
+    # Retry bootinfo forever
+    print(':0_retry_bootinfo')
+    ipxe_debug('echo sleeping %s seconds before polling bootinfo' % delay)
+    print('sleep %s' % delay)
+    print('goto 0_bootinfo')
+
+    # Received bootinfo
+    print(':0_received_bootinfo')
+
+    # Check to see if bootwhat_type_part is set. If so, then maybe it's time to
+    # boot. Otherwise, proceed with the next check
+    print(':check_type_part')
+    print('isset ${bibootwhat_type_part} || goto check_mfs_frisbee')
+    ipxe_debug('echo bibootwhat_type_part is set')
+
+    print('isset ${bibootwhat_part} || goto check_for_wait')
+    ipxe_debug('echo bibootwhat_part is ${bibootwhat_part}')
+
+    # If the commandline isn't set, then the experiment has been freed
+    # and this node needs to wait for further instructions
+    print('isset ${bibootwhat_cmdline} || goto send_pxewait_then_retry')
+    ipxe_debug('echo bibootwhat_cmdline is "${bibootwhat_cmdline}"')
+    ipxe_debug('sleep %s' % delay)
+
+    # The cmdline is set, which is the iPXE sanboot argument
+    ipxe_debug('echo bibootwhat_cmdline is ${bibootwhat_cmdline}')
+    print('set initiator-iqn %s' % node.iscsi_initiatorname)
+    print('sanhook ${bibootwhat_cmdline} || goto 0_retry_bootinfo')
+    print('sleep %s' % delay)
+    print('sanboot --no-describe --drive 0x80')
+    # print('sanboot ${bibootwhat_cmdline}')
+
+    print(':check_mfs_frisbee')
+    print('iseq ${bibootwhat_mfs} /tftpboot/frisbee || goto check_for_wait')
+    ipxe_debug('echo /tftpboot/frisbee is set, waiting for diskless '
+               'provisioning to complete')
+    print('goto send_reloading_events')
+
+    # Check to see if bootwhat_type_wait is set.  If so,
+    # retry bootinfo, indefinitely
+    print(':check_for_wait')
+    print('isset ${bibootwhat_type_wait} || goto check_reboot')
+    ipxe_debug('echo bibootwhat_type_wait is set')
+
+    print(':send_pxewait_then_retry')
+    state_change(boss_ip, 'PXEWAIT')
+    print('goto 0_retry_bootinfo')
+
+    # Check for reboot
+    print(':check_reboot')
+    print('isset ${bibootwhat_type_reboot} || goto check_auto')
+    ipxe_debug('echo bibootwhat_type_reboot is set')
+    print('reboot')
+
+    # Check for auto (what is auto?) Let's just retry bootinfo
+    # because I dunno what else to do
+    print(':check_auto')
+    print('isset ${bibootwhat_type_auto} || goto check_mfs')
+    ipxe_debug('echo bibootwhat_type_auto is set')
+    print('goto 0_retry_bootinfo')
+
+    # Booting from mfs isn't supported in diskless emulab,
+    # so, this is probably trying to boot frisbee, which may
+    # as well be bootwait, so retry bootinfo
+    print(':check_mfs')
+    print('isset ${bibootwhat_type_mfs} || goto check_type_part')
+    ipxe_debug('echo bibootwhat_type_mfs is set')
+    ipxe_debug('echo bibootwhat_mfs ${bibootwhat_mfs}')
+
+    # Looks strange - regardless of outcome, retry bootinfo. This is placed
+    # here for future changes where if /tftpboot/freebsd isn't the mfs, do
+    # something other than retry bootinfo
+    print(':check_mfs_freebsd')
+    print('iseq ${bibootwhat_mfs} /tftpboot/freebsd || goto 0_retry_bootinfo')
+    ipxe_debug('echo /tftpboot/freebsd is set, needs fake reload?')
+    # ipxe_debug('echo chainbooting to pxeboot.emu')
+    # print('chain pxeboot.emu')
+    # print('goto 0_retry_bootinfo')
+    print('goto send_reloading_events')
+
+    # If execution of the ipxe script reaches this point, I think that this
+    # means that the local disk is to be provisioned using frisbee.
+    #
+    # However, this is a diskless Emulab setup where the boss node requests
+    # that the iSCSI server provision a clone and requests that the prep
+    # server prepare the target.
+    #
+    # Send an events to make stated happy and make it look like frisbee is
+    # running
+    print(':send_reloading_events')
+    ipxe_debug('echo send_reloading_events')
+    state_change(boss_ip, 'BOOTING')
+    state_change(boss_ip, 'RELOADSETUP')      # RELOAD
+    state_change(boss_ip, 'RELOADING')        # RELOAD
+    state_change(boss_ip, 'RELOADDONEV2')     # RELOAD
+    state_change(boss_ip, 'SHUTDOWN')         # NORMALv2
+    state_change(boss_ip, 'PXEBOOTING', "1")  # NORMALv2 -> PXEKERNEL forced
+
+    # Jump back to bootinfo and keep polling
+    print('goto 0_retry_bootinfo')
+
+
+def node_not_found():
+    '''Handle the event when a node is not event'''
+    ipxe_header()
+    print('echo Node not found')
+    print(':0_dhcp')
+    ipxe_debug('echo Sending DHCP request')
+    print('dhcp || goto 0_retry_dhcp')
+    print('goto 0_pxeboot_emu')
+
+    # Sleep for 5 seconds and retry dhcp, do this forever
+    print(':0_retry_dhcp')
+    print('sleep %s' % delay)
+    print('goto 0_dhcp')
+
+    print(':0_pxeboot_emu')
+    ipxe_debug('echo chainbooting to pxeboot.emu')
+    print('chain tftp://%s/pxeboot.emu' % boss_ip)
+
+log = Log(prog_name)
+
+ip_addr = None
+
+if 'REMOTE_ADDR' in os.environ:
+    ip_addr = os.environ['REMOTE_ADDR']
+
+if ip_addr is not None:
+    try:
+        # Pull the node from the database
+        log.critical('Getting node for IP %s' % ip_addr)
+        node = Node.from_control_ip(ip_addr)
+
+        if node is None:
+            # This might be a new node and needs to perform the checkin process
+            log.critical('Node not found %s' % ip_addr)
+            node_not_found()
+        else:
+            # Send the iPXE header to the remote client
+            ipxe_script(node)
+    except:
+        # This might be a new node and needs to perform the checkin process
+        log.critical('Node not found %s' % ip_addr)
+        node_not_found()
+else:
+    log.critical('No IP address in environment, cannot PXE boot')

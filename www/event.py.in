@@ -1,0 +1,131 @@
+#!/usr/local/bin/python
+#--------------------------------------------------------------------------------
+# Copyright (c) 2000-2014 New Mexico Consortium
+# 
+# {{{EMULAB-LICENSE
+# 
+# This file is part of the Emulab network testbed software.
+# 
+# This file is free software: you can redistribute it and/or modify it
+# under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or (at
+# your option) any later version.
+# 
+# This file is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU Affero General Public License
+# along with this file.  If not, see <http://www.gnu.org/licenses/>.
+# 
+# }}}
+#--------------------------------------------------------------------------------
+
+import sys,os
+sys.path.append("/usr/testbed/lib")
+from tbevent import *
+
+server = '@BOSSNODE_IP@'
+port = ''
+
+from diskless.db import EmulabMySQLdb
+from diskless.db import Image
+from diskless.db import Interface
+from diskless.db import Reserved
+from diskless.db import Node
+from diskless.log import Log
+
+log = None
+   
+#--------------------------------------------------------------------------------
+# Send a state change event to the Emulab event subsystem
+#--------------------------------------------------------------------------------
+def state_change(node, new_state):
+    #
+    # Allocate and initialize an address tuple like any other python object, there
+    # is no need to use address_tuple_alloc().
+    #
+    log.info('state change: %s:%s' % (node.node_id, new_state))
+    at = address_tuple()
+    at.host = ADDRESSTUPLE_ALL
+    at.objname = node.node_id
+    at.objtype = "TBNODESTATE"
+    at.eventtype = new_state
+    
+    # Construct a regular client,
+    ec = EventClient(server=server, port=port)
+    # ... create our notification, and
+    en = ec.create_notification(at)
+    # ... send it off.
+    ec.notify(en)
+    
+#--------------------------------------------------------------------------------
+# Send a mode change event to the Emulab event subsystem
+#--------------------------------------------------------------------------------
+def mode_change(node, new_mode):
+    #
+    # Allocate and initialize an address tuple like any other python object, there
+    # is no need to use address_tuple_alloc().
+    #
+    log.info('mode change: %s:%s' % (node.node_id, new_mode))
+    at = address_tuple()
+    at.host = ADDRESSTUPLE_ALL
+    at.objname = node.node_id
+    at.objtype = "TBNODEOPMODE"
+    at.eventtype = new_mode
+    
+    # Construct a regular client,
+    ec = EventClient(server=server, port=port)
+    # ... create our notification, and
+    en = ec.create_notification(at)
+    # ... send it off.
+    ec.notify(en)
+
+def url_query():
+    query_string = os.environ.get('QUERY_STRING', None)
+    query = {}
+
+    if query_string is not None:
+        log.info('query string: %s' % query_string)
+        keypairs = query_string.split('&')
+        log.info('keypairs: %s' % keypairs)
+
+        for pair in keypairs:
+            pair_list = pair.split('=')
+
+            if pair_list:
+                if len(pair_list) >= 2:
+                    query[pair_list[0]] = pair_list[1]
+                elif len(pair_list) == 1:
+                    query[pair_list[0]] = ''
+
+    return query
+
+log = Log(sys.argv[0])
+ 
+ip_addr = '10.57.1.1'
+if os.environ.has_key('REMOTE_ADDR'):
+    ip_addr = os.environ['REMOTE_ADDR']
+
+node = Node.from_control_ip(ip_addr)
+
+query = url_query()
+
+if len(query) > 0:
+   state = query.get('state', None)
+   mode = query.get('mode', None)
+
+   if mode is not None:
+       mode_change(node, mode)
+
+   if state is not None:
+       state_change(node, state)
+
+log.info('environ: %s' % os.environ)
+
+
+print "Content-Type: text/html"     # HTML is following
+print
+print "<html>success</html>"
+
