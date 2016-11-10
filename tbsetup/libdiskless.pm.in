@@ -53,11 +53,7 @@ my $lun_clone_poll_interval = 1;
 my $http_timeout = 120;
 
 # Move to /etc/emulab/diskless.conf
-my $percent_wanted_for_batch = 0.1;
-# Percent of number of nodes remaining to be provisioned to form a batch
-my $batch_percent = 0.1;
-# Anything more than this number qualifies for a batch
-my $total_wanted_for_batch = 10;
+# Minimum time to wait before starting another batch
 my $batch_interval = 20;
 
 
@@ -76,6 +72,7 @@ use User;
 use OSinfo;
 use English;
 use event;
+use POSIX;
 
 my $debug_level = 0;
 
@@ -192,6 +189,18 @@ sub provision_luns($$$) {
     return \@failed_nodes;
 }
 
+sub min_needed_for_batch($$$) {
+    my ($start_time, $num_nodes, $max) = @_;
+    my $elapsed = (time() - $start_time) / 60.0;
+    my $val = (1.0 + -1.0 / (1.0 + exp(-2 * $elapsed + 4))) * $num_nodes;
+    if ($val < 1.0) {
+        $val = 1.0;
+    } elsif ($val > $max) {
+        $val = $max;
+    }
+    return floor($val);
+}
+
 sub deprovision_luns($$$) {
     my ($nodes, $status_cb, $error_cb) = @_;
 
@@ -217,6 +226,8 @@ sub deprovision_luns($$$) {
     my $being_provisioned = {};
     # When is it ok to start another batch?
     my $time_to_batch = time() + $batch_interval;
+    # Start time
+    my $start_time = time();
     # When should nodes that are not waiting be rebooted?
     my $time_to_reboot = time();
     # Overall provisioning_timeout
@@ -225,7 +236,8 @@ sub deprovision_luns($$$) {
     my $job_list = [];
     # Partion table updates
     my $update_partitions = {};
-
+    # Total number of nodes
+    my $num_nodes = @$nodes;
     # List of nodes that are not in PXEWAIT
     my $waiting = nodes_waiting($needs_lun);
 
@@ -245,6 +257,9 @@ sub deprovision_luns($$$) {
     debug(20, "nodes waiting: ", keys %$waiting);
     debug(20, "nodes not waiting:", keys %$not_waiting);
 
+    my $num_remaining = keys %{$needs_lun};
+
+    my $min_batch_size = min_needed_for_batch($start_time, $num_nodes, $num_remaining);
     # Update waiting and not_waiting as PXEWAIT events are received
     my $ev_handle = create_event_handler(
         sub {
@@ -256,9 +271,10 @@ sub deprovision_luns($$$) {
 
             if(defined($node_id) && defined($event)) {
                 if (defined($not_waiting->{$node_id})) {
-                    $status_cb->("Received $event from $node_id, moving to ",
-                                 "list of waiting nodes");
                     $waiting->{$node_id} = $not_waiting->{$node_id};
+                    my $num_waiting = $num_nodes - keys(%$not_waiting);
+                    $status_cb->("Received $event from $node_id, moving to ",
+                                 "list of waiting nodes ($num_waiting / $min_batch_size / $num_remaining)");
                     delete $not_waiting->{$node_id};
                 }
             }
@@ -267,8 +283,6 @@ sub deprovision_luns($$$) {
     if (!defined($ev_handle)) {
         return 1;
     }
-
-    my $num_remaining = keys %{$needs_lun};
 
     # Place to keep all $server_node return values. The goal is to keep the
     # reference counts above 1
@@ -282,15 +296,12 @@ sub deprovision_luns($$$) {
        my $num_ready = keys %{$ready};
 
        # Minimum batch size
-       my $min_batch_size = $num_remaining * $batch_percent;
-       if ($min_batch_size < 1) {
-           $min_batch_size = 1;
-       }
-       # debug(10, "min_batch_size: $min_batch_size");
+       $min_batch_size = min_needed_for_batch($start_time, $num_nodes, $num_remaining);
 
        # If the number of nodes that are in PXEWAIT exceed the number
        # that we want for a batch, start a LUN provisioning job
        if ($num_ready >= $min_batch_size && time() >= $time_to_batch) {
+           $status_cb->("Creating LUN deprovision batch of size $num_ready, total remaining: $num_remaining");
            debug(20, "num_ready >= min_batch_size: " .
                      "$num_ready >= $min_batch_size");
            my ($targets, $upts, $server_node) = iscsi_target_list($ready, $action,
