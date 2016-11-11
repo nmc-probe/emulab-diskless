@@ -192,7 +192,7 @@ sub provision_luns($$$) {
 sub min_needed_for_batch($$$) {
     my ($start_time, $num_nodes, $max) = @_;
     my $elapsed = (time() - $start_time) / 60.0;
-    my $val = (1.0 + -1.0 / (1.0 + exp(-2 * $elapsed + 4))) * $num_nodes;
+    my $val = (1.0 + -1.0 / (1.0 + exp(-1 * $elapsed + 4))) * $num_nodes;
     if ($val < 1.0) {
         $val = 1.0;
     } elsif ($val > $max) {
@@ -257,9 +257,6 @@ sub deprovision_luns($$$) {
     debug(20, "nodes waiting: ", keys %$waiting);
     debug(20, "nodes not waiting:", keys %$not_waiting);
 
-    my $num_remaining = keys %{$needs_lun};
-
-    my $min_batch_size = min_needed_for_batch($start_time, $num_nodes, $num_remaining);
     # Update waiting and not_waiting as PXEWAIT events are received
     my $ev_handle = create_event_handler(
         sub {
@@ -272,9 +269,9 @@ sub deprovision_luns($$$) {
             if(defined($node_id) && defined($event)) {
                 if (defined($not_waiting->{$node_id})) {
                     $waiting->{$node_id} = $not_waiting->{$node_id};
-                    my $num_waiting = $num_nodes - keys(%$not_waiting);
+                    my $num_waiting = keys(%$waiting);
                     $status_cb->("Received $event from $node_id, moving to ",
-                                 "list of waiting nodes ($num_waiting / $min_batch_size / $num_remaining)");
+                                 "list of waiting nodes ($num_waiting / $num_nodes)");
                     delete $not_waiting->{$node_id};
                 }
             }
@@ -288,6 +285,8 @@ sub deprovision_luns($$$) {
     # reference counts above 1
     my @server_node_list = ();
 
+    my $num_remaining = keys %{$needs_lun};
+
     while (time() <= $provisioning_timeout && $num_remaining > 0) {
        my $ready = set_subtract($waiting, $being_provisioned);
        $ready = set_subtract($ready, $has_lun);
@@ -296,7 +295,7 @@ sub deprovision_luns($$$) {
        my $num_ready = keys %{$ready};
 
        # Minimum batch size
-       $min_batch_size = min_needed_for_batch($start_time, $num_nodes, $num_remaining);
+       my $min_batch_size = min_needed_for_batch($start_time, $num_nodes, $num_remaining);
 
        # If the number of nodes that are in PXEWAIT exceed the number
        # that we want for a batch, start a LUN provisioning job
