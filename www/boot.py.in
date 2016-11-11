@@ -45,9 +45,7 @@ boss_ip = "@BOSSNODE_IP@"
 delay = 7
 
 prog_name = 'boot.py'
-
-debug = 0
-# Log handler
+debug = None
 log = None
 
 
@@ -71,23 +69,6 @@ def state_change(boss_ip, state, suffix=None):
     print(':%s' % skip_label)
 
 
-def state_change_old(boss_ip, state):
-    '''Send a state change event to the Emulab event subsystem'''
-    event_state_var = '%s_sent' % state
-    imgfetch_cmd = 'imgfetch --name state http://%s/event.py?state=%s' % \
-                   (boss_ip, state)
-
-    print('iseq ${current_state} %s && goto current_state_%s ||' %
-          (state, state))
-    print(':set_state_%s' % state)
-    ipxe_debug('echo setting state %s' % state)
-    print('isset ${%s} || %s' % (event_state_var, imgfetch_cmd))
-    print('isset ${%s} || sleep %s' % (event_state_var, delay))
-    print('isset ${%s} || set %s 1' % (event_state_var, event_state_var))
-    print('set ${current_state} %s' % state)
-    print(':current_state_%s' % state)
-
-
 def ipxe_debug(cmd):
     if debug:
         print(cmd)
@@ -108,19 +89,20 @@ def ipxe_script(node):
     initiator_name = node.iscsi_initiatorname
 
     if initiator_name is None:
-        message = 'Node %s does not have an initiator name, cannot boot iscsi diskless.' % node.node_id
+        message = """Node %s does not have an initiator name, cannot boot iscsi
+                  diskless.""" % node.node_id
         print ('echo %s' % message)
         log.critical(message)
         return
 
     ipxe_header()
 
-    # Initial dhcp, if fails, goto 0_retry_dhcp
-    print(':0_dhcp')
-    ipxe_debug('echo Sending DHCP request')
-    print('sleep %s' % delay)
-    # print('ifconf -c dhcp net0 || goto 0_dhcp')
-    print('dhcp || goto 0_dhcp')
+    # To get to this point, the node must have already DHCPed an address.
+    # However, iPXE doesn't enable that interface by default. ifopen does that
+    print(':0_ifopen')
+    ipxe_debug('echo Enabling net0')
+    print('echo IP: ${net0/ip} ${net0/netmask} ${net0/gateway}')
+    print('ifopen net0 || goto 0_ifopen')
     state_change(boss_ip, 'PXEBOOTING')
     print('goto 0_bootinfo')
 
@@ -250,15 +232,15 @@ def node_not_found():
     '''Handle the event when a node is not event'''
     ipxe_header()
     print('echo Node not found')
-    print(':0_dhcp')
-    ipxe_debug('echo Sending DHCP request')
-    print('dhcp || goto 0_retry_dhcp')
+    print(':0_ifopen')
+    ipxe_debug('echo Enabling net0')
+    print('ifopen net0 || goto 0_ifopen')
     print('goto 0_pxeboot_emu')
 
     # Sleep for 5 seconds and retry dhcp, do this forever
-    print(':0_retry_dhcp')
+    print(':0_retry_ifopen')
     print('sleep %s' % delay)
-    print('goto 0_dhcp')
+    print('goto 0_ifopen')
 
     print(':0_pxeboot_emu')
     ipxe_debug('echo chainbooting to pxeboot.emu')
